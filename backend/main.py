@@ -1,14 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
-from datetime import datetime
 import csv
 import io
+import os
+import uuid
+from typing import List, Optional
 
-from schemas import Patient, Bill, BillItem
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi.middleware.cors import CORSMiddleware
+
 from database import db, create_document, get_documents
+from schemas import Patient, Bill, BillItem
 
-app = FastAPI(title="MediTrack API")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,147 +21,153 @@ app.add_middleware(
 )
 
 
-def generate_patient_id(name: str) -> str:
-    base = "PT-" + datetime.utcnow().strftime("%y%m%d")
-    suffix = str(abs(hash(name + str(datetime.utcnow().timestamp()))) % 100000).zfill(5)
-    return f"{base}-{suffix}"
+# Helpers
+
+def generate_patient_id() -> str:
+    return f"P-{uuid.uuid4().hex[:8].upper()}"
 
 
 def upsert_inventory(items: List[BillItem]):
-    database = db()
-    if database is None:
-        return
     for it in items:
-        # Increase qty, update avg_price with simple blend
-        existing = database["inventory"].find_one({"name": it.name})
+        coll = db["inventory"]
+        existing = coll.find_one({"name": it.name})
         if existing:
             new_qty = int(existing.get("qty", 0)) + int(it.qty)
-            new_price = float(it.price)
-            database["inventory"].update_one(
-                {"_id": existing["_id"]},
-                {"$set": {"qty": new_qty, "avg_price": new_price, "updatedAt": datetime.utcnow()}},
-            )
+            current_total_value = float(existing.get("avg_price", 0)) * int(existing.get("qty", 0))
+            added_value = float(it.price) * int(it.qty)
+            new_avg = (current_total_value + added_value) / max(1, new_qty)
+            coll.update_one({"_id": existing["_id"]}, {"$set": {"qty": new_qty, "avg_price": round(new_avg, 2)}})
         else:
-            database["inventory"].insert_one({
-                "name": it.name,
-                "qty": int(it.qty),
-                "avg_price": float(it.price),
-                "updatedAt": datetime.utcnow(),
-                "createdAt": datetime.utcnow(),
-            })
+            coll.insert_one({"name": it.name, "qty": int(it.qty), "avg_price": float(it.price)})
 
 
-@app.get("/test")
-async def test():
-    try:
-        _ = db()
-        return {"ok": True, "message": "DB connected"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def require_doctor_or_manager(request: Request):
+    role = request.headers.get("X-Role", "").lower()
+    if role not in {"doctor", "manager"}:
+        raise HTTPException(status_code=403, detail="Only Doctor or Manager can modify billing/medicines")
+
+
+# Endpoints
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "MediTrack API"}
 
 
 @app.post("/patients", response_model=Patient)
-async def create_patient(p: Patient):
-    if not p.patient_id:
-        p.patient_id = generate_patient_id(p.name)
-    payload = p.dict()
-    payload["createdAt"] = payload.get("createdAt") or datetime.utcnow()
-    saved = create_document("patient", payload)
-    return Patient(**saved)
+async def create_patient(patient: Patient):
+    if not patient.patient_id:
+        patient.patient_id = generate_patient_id()
+    if db["patient"].find_one({"patient_id": patient.patient_id}):
+        raise HTTPException(status_code=400, detail="Patient ID already exists")
+    create_document("patient", patient)
+    return patient
 
 
 @app.get("/patients/{patient_id}", response_model=Patient)
 async def get_patient(patient_id: str):
-    docs = get_documents("patient", {"patient_id": patient_id}, limit=1)
-    if not docs:
+    doc = db["patient"].find_one({"patient_id": patient_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="Patient not found")
-    return Patient(**docs[0])
+    doc.pop("_id", None)
+    return doc
 
 
 @app.post("/bills", response_model=Bill)
-async def create_bill(b: Bill):
-    if not b.patient_id:
-        raise HTTPException(status_code=400, detail="patient_id is required")
-    payload = b.dict()
-    payload["bill_id"] = payload.get("bill_id") or ("B-" + datetime.utcnow().strftime("%y%m%d%H%M%S"))
-    payload["createdAt"] = payload.get("createdAt") or datetime.utcnow()
-    saved = create_document("bill", payload)
-    # Update inventory from billed items
-    upsert_inventory(b.items)
-    return Bill(**saved)
+async def create_bill(request: Request, bill: Bill):
+    require_doctor_or_manager(request)
+    p = db["patient"].find_one({"patient_id": bill.patient_id})
+    if not p:
+        raise HTTPException(status_code=400, detail="Invalid patient_id")
+    bill.bill_id = f"B-{uuid.uuid4().hex[:8].upper()}"
+    bill.total = sum([i.qty * i.price for i in bill.items])
+    create_document("bill", bill)
+    upsert_inventory(bill.items)
+    return bill
 
 
 @app.get("/bills/by-patient/{patient_id}")
 async def bills_by_patient(patient_id: str):
-    docs = get_documents("bill", {"patient_id": patient_id}, limit=100)
-    return docs
+    bills = get_documents("bill", {"patient_id": patient_id})
+    for b in bills:
+        b["_id"] = str(b["_id"])  # serialize
+    return bills
 
 
 @app.get("/inventory")
-async def list_inventory(limit: int = 100):
-    docs = get_documents("inventory", {}, limit=limit)
-    return docs
+async def get_inventory():
+    items = get_documents("inventory", {})
+    for it in items:
+        it["_id"] = str(it["_id"])  # serialize
+    return items
 
 
-@app.post("/bills/upload-csv")
-async def upload_bill_csv(file: UploadFile = File(...)):
-    # Expect CSV with headers: name,qty,price,patient_id,patient_name,patient_phone,doctor,mrn
+@app.post("/bills/upload-csv", response_model=Bill)
+async def upload_bill_csv(request: Request, file: UploadFile = File(...), patient_id: Optional[str] = Form(None)):
+    require_doctor_or_manager(request)
     content = await file.read()
-    try:
-        text = content.decode("utf-8")
-    except Exception:
-        raise HTTPException(400, detail="Invalid file encoding")
-
+    text = content.decode("utf-8")
     reader = csv.DictReader(io.StringIO(text))
     items: List[BillItem] = []
-    patient_id: Optional[str] = None
-    patient_name: Optional[str] = None
-    patient_phone: Optional[str] = None
-    doctor: Optional[str] = None
-    mrn: Optional[str] = None
 
-    subtotal = 0.0
+    temp_patient = None
     for row in reader:
-        if "name" in row and row["name"]:
-            qty = int(float(row.get("qty", 1)))
-            price = float(row.get("price", 0))
-            items.append(BillItem(name=row["name"], qty=qty, price=price))
-            subtotal += qty * price
-        # capture patient/meta fields if present per-row or just first row
-        patient_id = patient_id or row.get("patient_id")
-        patient_name = patient_name or row.get("patient_name")
-        patient_phone = patient_phone or row.get("patient_phone")
-        doctor = doctor or row.get("doctor")
-        mrn = mrn or row.get("mrn")
+        name = row.get("name") or row.get("item")
+        qty = int(row.get("qty") or 1)
+        price = float(row.get("price") or 0)
+        if not name:
+            continue
+        items.append(BillItem(name=name, qty=qty, price=price))
+        if not patient_id:
+            pname = row.get("patient_name")
+            pphone = row.get("patient_phone")
+            mrn = row.get("mrn")
+            doctor = row.get("doctor")
+            if pname:
+                temp_patient = Patient(name=pname, phone=pphone, mrn=mrn, doctor=doctor)
 
     if not items:
-        raise HTTPException(400, detail="CSV contains no items")
+        raise HTTPException(status_code=400, detail="No items found in CSV")
 
     if not patient_id:
-        # If not provided, auto-create a patient with given name/phone
-        if not patient_name:
-            raise HTTPException(400, detail="CSV missing patient_id or patient_name")
-        new_patient = Patient(name=patient_name, phone=patient_phone, mrn=mrn)
-        new_patient.patient_id = generate_patient_id(patient_name)
-        created = create_document("patient", new_patient.dict())
-        patient_id = new_patient.patient_id
+        if temp_patient is None:
+            raise HTTPException(status_code=400, detail="CSV must include patient_id or patient_name")
+        temp_patient.patient_id = generate_patient_id()
+        create_document("patient", temp_patient)
+        patient_id = temp_patient.patient_id
 
-    tax = round(subtotal * 0.12, 2)
-    total = round(subtotal + tax, 2)
+    bill = Bill(patient_id=patient_id, items=items)
+    bill.bill_id = f"B-{uuid.uuid4().hex[:8].upper()}"
+    bill.total = sum([i.qty * i.price for i in bill.items])
+    create_document("bill", bill)
 
-    bill = Bill(
-        patient_id=patient_id,
-        patient_name=patient_name,
-        patient_phone=patient_phone,
-        doctor=doctor,
-        mrn=mrn,
-        items=items,
-        subtotal=subtotal,
-        tax=tax,
-        total=total,
-    )
-
-    saved = create_document("bill", bill.dict())
-    # Update inventory
     upsert_inventory(items)
-    return saved
+    return bill
+
+
+@app.post("/bills/upload-image", response_model=Bill)
+async def upload_bill_image(request: Request, file: UploadFile = File(...), patient_id: Optional[str] = Form(None)):
+    require_doctor_or_manager(request)
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="patient_id is required for image uploads")
+
+    items = [BillItem(name=f"Image: {file.filename}", qty=1, price=0.0)]
+
+    bill = Bill(patient_id=patient_id, items=items)
+    bill.bill_id = f"B-{uuid.uuid4().hex[:8].upper()}"
+    bill.total = sum([i.qty * i.price for i in bill.items])
+    create_document("bill", bill)
+
+    upsert_inventory(items)
+    return bill
+
+
+@app.get("/test")
+async def test():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
